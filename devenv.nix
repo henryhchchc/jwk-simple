@@ -9,6 +9,8 @@
 
   dotenv.enable = true;
 
+  dagger.enable = true;
+
   env = {
     CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
   };

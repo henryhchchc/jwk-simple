@@ -1,0 +1,1787 @@
+enum FixTool {
+  CLIPPY
+  FMT
+}
+
+type Rust {
+  let source: Directory!
+  let workspacePath: String!
+
+  let targets: [String!]! = []
+  let preferDist: Boolean!
+
+  let sourceDateEpoch: String = null
+
+  let chef: CargoChef
+
+  let cargoTargetCache: CacheVolume
+
+  pub container: Container!
+
+  new(
+    workspace: Workspace!,
+    """
+    Version (image tag) to use from the official image repository as a base container.
+    """
+    version: String! = "latest",
+    """
+    Custom container to use as a base container.
+    """
+    container: Container! = Dagger.container.from("rust:" + version),
+    """
+    Targets to install for cross-compilation.
+    """
+    targets: [String!]! = [],
+    """
+    Tools to install.
+    """
+    tools: [String!]! = [],
+    """
+    Prefer installing tool dependencies from pre-built binaries (if available) instead of building from source.
+    """
+    preferDist: Boolean! = true,
+    """
+    Whether to use cargo-chef for dependency caching.
+    Recommended for maximum cache efficiency.
+    Note: requires curl or wget to be installed in the base container.
+    """
+    useCargoChef: Boolean! = true,
+    """
+    Version of cargo-chef to use.
+    """
+    cargoChefVersion: String! = "latest",
+    """
+    Whether to disable automatically mounted cache volumes.
+    Useful if you want to mount cache volumes manually or use a different cache volume strategy.
+    """
+    noCache: Boolean! = false,
+    """
+    Override the source date epoch for reproducible builds.
+
+    If not set, the epoch is determined from the git log (if available).
+    """
+    sourceDateEpoch: String = null,
+    """
+    Cache volume for cargo registry index.
+    """
+    cargoRegistryIndexCache: CacheVolume = if (!noCache) {
+      Dagger.cacheVolume("cargo-registry-index")
+    } else {
+      null
+    },
+    """
+    Cache volume for cargo registry archive.
+    """
+    cargoRegistryArchiveCache: CacheVolume = if (!noCache) {
+      Dagger.cacheVolume("cargo-registry-cache")
+    } else {
+      null
+    },
+    """
+    Cache volume for cargo git db.
+    """
+    cargoGitDbCache: CacheVolume = if (!noCache) {
+      Dagger.cacheVolume("cargo-git-db")
+    } else {
+      null
+    },
+    """
+    Cache volume for cargo target.
+    """
+    cargoTargetCache: CacheVolume = if (!noCache) {
+      Dagger.cacheVolume("cargo-target")
+    } else {
+      null
+    },
+    """
+    Cache volume for rustup toolchains.
+    """
+    rustupToolchainCache: CacheVolume = if (!noCache) {
+      Dagger.cacheVolume("rustup-toolchain")
+    } else {
+      null
+    },
+    """
+    Cache volume for rustup downloads.
+    """
+    rustupDownloadCache: CacheVolume = if (!noCache) {
+      Dagger.cacheVolume("rustup-download")
+    } else {
+      null
+    },
+  ) {
+    self.source = workspace.directory("/", gitignore: true)
+    self.workspacePath = workspace.path
+
+    container = mountCache(container, "${CARGO_HOME}/registry/index", cargoRegistryIndexCache)
+    container = mountCache(container, "${CARGO_HOME}/registry/cache", cargoRegistryArchiveCache)
+    container = mountCache(container, "${CARGO_HOME}/git/db", cargoGitDbCache)
+
+    container = container
+      .withMountedDirectory(
+        "/work/src",
+        workspace.directory(
+          "/",
+          gitignore: true,
+          include: ["**/rust-toolchain.toml"],
+        ),
+      )
+      .withWorkdir("/work/src/" + workspacePath)
+      .withExec(["rustup", "show"])
+
+    # This doesn't work due to rustup using symlinks
+    # container = mountCache(container, "${RUSTUP_HOME}/toolchains", rustupToolchainCache)
+    # container = mountCache(container, "${RUSTUP_HOME}/downloads", rustupDownloadCache)
+    if (!targets.isEmpty) {
+      container = container.withExec(["rustup", "target", "add"] + targets)
+    }
+
+    container = container.withoutMount("/work/src").withWorkdir("/")
+
+    if (useCargoChef) {
+      self.chef = CargoChef(cargoChefVersion, container)
+    }
+
+    container = container.withExec(["rustup", "component", "add", "rustfmt", "clippy"])
+
+    tools = ["cargo-audit@0.22.0"] + tools
+
+    tools.each { tool => container = installTool(container, tool, preferDist: preferDist) }
+
+    self.cargoTargetCache = cargoTargetCache
+    self.preferDist = preferDist
+    self.sourceDateEpoch = sourceDateEpoch
+
+    self.container = container
+
+    self
+  }
+
+  let mountCache(container: Container!, path: String!, cache: CacheVolume): Container! {
+    if (cache != null) {
+      container = container.withMountedCache(path, cache, expand: true)
+    }
+
+    container
+  }
+
+  let installTool(
+    container: Container!,
+    tool: String!,
+    version: String! = "",
+    preferDist: Boolean! = true,
+  ): Container! {
+    let nameVersion = tool.split("@")
+
+    let toolName = nameVersion[0] ?? ""
+
+    if (version == "" and nameVersion.length > 1) {
+      version = nameVersion[1] ?? ""
+    }
+
+    if (toolName == "") {
+      raise "tools must be in the format 'name[@version]'"
+    }
+
+    let installer = resolveInstaller(container, toolName, version, preferDist: preferDist)
+
+    installer.install(container)
+  }
+
+  let resolveInstaller(
+    container: Container!,
+    name: String!,
+    version: String!,
+    preferDist: Boolean! = true,
+  ): Installer! {
+    let installer: Installer
+
+    if (preferDist or name == "binaryen") {
+      installer = resolveDistInstaller(name, version)
+    }
+
+    if (installer != null) {
+      installer
+    } else {
+      Installer(
+        downloader: CargoBuildDownloader(container, name, version),
+        composer: BinaryComposer,
+      )
+    }
+  }
+
+  let resolveDistInstaller(name: String!, version: String!): Installer {
+    case (name) {
+      "cargo-audit" => {
+        let version = noLatest("cargo-audit", version).trimPrefix("v")
+
+        Installer(
+          downloader: GitHubDownloader(
+            repository: "rustsec/rustsec",
+            fileName: "cargo-audit-@@ARCH@@-unknown-linux-gnu-v@@VERSION@@.tgz",
+            version: "cargo-audit/v" + version,
+            replacer: Replacers([RustArchReplacer, VersionReplacer(version)]),
+          ),
+          composer: ExtractToolComposer("cargo-audit", stripComponents: true),
+        )
+      }
+
+      "cargo-zigbuild" => {
+        Installer(
+          downloader: GitHubDownloader(
+            repository: "rust-cross/cargo-zigbuild",
+            fileName: "cargo-zigbuild-@@ARCH@@-unknown-linux-gnu.tar.xz",
+            version: latestOrVersion(version),
+            replacer: RustArchReplacer,
+          ),
+          composer: ExtractToolComposer("cargo-zigbuild", stripComponents: true),
+        )
+      }
+
+      "binaryen" => {
+        let version = binaryenVersion(version)
+
+        Installer(
+          downloader: GitHubDownloader(
+            repository: "WebAssembly/binaryen",
+            fileName: "binaryen-@@VERSION@@-@@ARCH@@-linux.tar.gz",
+            version: version,
+            replacer: Replacers([RustArchReplacer, VersionReplacer(version)]),
+          ),
+          composer: ExtractArchiveComposer(stripComponents: true),
+        )
+      }
+
+      "dioxus-cli" => {
+        Installer(
+          downloader: GitHubDownloader(
+            repository: "DioxusLabs/dioxus",
+            fileName: "dx-@@ARCH@@-unknown-linux-gnu.tar.gz",
+            version: latestOrVersion(version),
+            replacer: RustArchReplacer,
+          ),
+          composer: ExtractToolComposer("dx"),
+        )
+      }
+
+      "wasm-bindgen-cli" => {
+        let fileName = "wasm-bindgen-@@VERSION@@-@@ARCH@@-unknown-linux-gnu.tar.gz"
+        let version = githubReleaseTagOrVersion("wasm-bindgen/wasm-bindgen", version).trimPrefix("v")
+
+        Installer(
+          downloader: GitHubDownloader(
+            repository: "wasm-bindgen/wasm-bindgen",
+            fileName: fileName,
+            version: version,
+            replacer: Replacers([RustArchReplacer, VersionReplacer(version)]),
+          ),
+          composer: ExtractFilterComposer(
+            ["wasm-bindgen-test-runner", "wasm2es6js", "wasm-bindgen"],
+            stripComponents: true,
+          ),
+        )
+      }
+
+      "wasm-pack" => {
+        let fileName = "wasm-pack-@@VERSION@@-@@ARCH@@-unknown-linux-musl.tar.gz"
+        let version = "v" + githubReleaseTagOrVersion(
+          "wasm-bindgen/wasm-pack",
+          version,
+        ).trimPrefix("v")
+
+        Installer(
+          downloader: GitHubDownloader(
+            repository: "wasm-bindgen/wasm-pack",
+            fileName: fileName,
+            version: version,
+            replacer: Replacers([RustArchReplacer, VersionReplacer(version)]),
+          ),
+          composer: ExtractToolComposer("wasm-pack", stripComponents: true),
+        )
+      }
+
+      else => null
+    }
+  }
+
+  let noLatest(name: String!, version: String!): String! {
+    if (version == "latest" or version == "") {
+      raise name + ": latest version is not supported by this installer"
+    }
+
+    version
+  }
+
+  let latestOrVersion(version: String!): String! {
+    if (version == "latest" or version == "") {
+      "latest"
+    } else {
+      "v" + version.trimPrefix("v")
+    }
+  }
+
+  let githubReleaseTagOrVersion(repository: String!, version: String!): String! {
+    if (version == "latest" or version == "") {
+      ghRelease.latest(repository: repository).tag
+    } else {
+      version
+    }
+  }
+
+  let binaryenVersion(version: String!): String! {
+    "version_" + githubReleaseTagOrVersion("WebAssembly/binaryen", version).trimPrefix("version_")
+  }
+
+  let containerWithWarmCache: Container! {
+    let chef = self.chef
+    if (chef == null) {
+      return self.container
+    }
+
+    chef.warmContainer(self.container, self.source, self.workspacePath)
+  }
+
+  let containerWithSource(targetCache: Boolean! = false): Container! {
+    let container = self.containerWithWarmCache
+
+    if (targetCache) {
+      container = mountCache(container, "/work/target", self.cargoTargetCache)
+        .withEnvVariable("CARGO_TARGET_DIR", "/work/target")
+    }
+
+    container
+      .withMountedDirectory("/work/src", self.source)
+      .withWorkdir("/work/src/" + self.workspacePath)
+  }
+
+  pub buildContainer(epoch: String = null): Container! {
+    let container = self.containerWithSource(true)
+
+    epoch = self.resolveEpoch(epoch)
+    if (epoch != null) {
+      container = container.withEnvVariable("SOURCE_DATE_EPOCH", epoch)
+    }
+
+    container
+  }
+
+  let resolveEpoch(epoch: String = null): String {
+    if (epoch == null) {
+      epoch = self.sourceDateEpoch
+    }
+
+    if (epoch == null and self.source.exists(".git", expectedType: ExistsType.DIRECTORY_TYPE)) {
+      epoch = Dagger
+        .container
+        .from("alpine/git:v2.52.0")
+        .withMountedDirectory("/git", self.source)
+        .withExec(["log", "-1", "--format=%ct"], useEntrypoint: true)
+        .stdout
+    }
+
+    epoch
+  }
+
+  let prepareBuildContainer(container: Container!, epoch: String = null): Container! {
+    if (epoch == null) {
+      epoch = self.sourceDateEpoch
+    }
+
+    if (epoch == null and container.exists(".git", expectedType: ExistsType.DIRECTORY_TYPE)) {
+      epoch = container.withExec(["git", "log", "-1", "--format=%ct"]).stdout
+    }
+
+    if (epoch != null) {
+      container = container.withEnvVariable("SOURCE_DATE_EPOCH", epoch)
+    }
+
+    container
+  }
+
+  let resolveFile(path: String!): File! {
+    self.source.file(path)
+  }
+
+  let resolveTargets(targets: [String!]!): [String!]! {
+    if (targets.length == 0) { self.targets } else { targets }
+  }
+
+  let cargoArgs(
+    args: [String!]! = [],
+    features: [String!]! = [],
+    trailingArgs: [String!]! = [],
+  ): [String!]! {
+    features.each { feature =>
+      args += ["--features", feature]
+
+      feature
+    }
+
+    args + trailingArgs
+  }
+
+  let cargoCoreArgs(
+    args: [String!]! = [],
+    features: [String!]! = [],
+    trailingArgs: [String!]! = [],
+  ): [String!]! {
+    let args = self.cargoArgs(args, features)
+
+    args += ["--frozen"]
+
+    args + trailingArgs
+  }
+
+  """
+  Compile a local package and all of its dependencies.
+  """
+  pub build(
+    """
+    Package to build.
+    """
+    package: [String!]! = [],
+    """
+    Build all packages in the workspace.
+    """
+    all: Boolean! = false,
+    """
+    Exclude packages from the build.
+    """
+    exclude: [String!]! = [],
+    """
+    Build only this package's library.
+    """
+    lib: Boolean! = false,
+    """
+    Build all binaries.
+    """
+    bins: Boolean! = false,
+    """
+    Build only the specified binary.
+    """
+    bin: [String!]! = [],
+    """
+    Build all examples.
+    """
+    examples: Boolean! = false,
+    """
+    Build only the specified example.
+    """
+    example: [String!]! = [],
+    """
+    Build all targets that have `test = true` set.
+    """
+    tests: Boolean! = false,
+    """
+    Build only the specified test target.
+    """
+    test: [String!]! = [],
+    """
+    Build all targets that have `bench = true` set.
+    """
+    benches: Boolean! = false,
+    """
+    Build only the specified bench target.
+    """
+    bench: [String!]! = [],
+    """
+    Build all targets.
+    """
+    allTargets: Boolean! = false,
+    """
+    Build for the target triple.
+    """
+    target: [String!]! = [],
+    """
+    Activate all available features.
+    """
+    allFeatures: Boolean! = false,
+    """
+    List of features to activate.
+    """
+    feature: [String!]! = [],
+    """
+    Do not activate the `default` feature.
+    """
+    noDefaultFeatures: Boolean! = false,
+    """
+    Build artifacts in release mode, with optimizations.
+    """
+    release: Boolean! = false,
+    """
+    Build artifacts with the specified profile.
+    """
+    profile: String! = "",
+    """
+    Do not abort the build as soon as there is an error.
+    """
+    keepGoing: Boolean! = false,
+    """
+    Override the source date epoch for reproducible builds.
+
+    If not set, the epoch is determined from the git log (if available).
+    """
+    sourceDateEpoch: String = null,
+  ): Directory! @check {
+    let cmd = CargoCommand(frozen: self.chef != null, locked: self.chef == null)
+    let args = cmd.build(
+      package,
+      all,
+      exclude,
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      tests,
+      test,
+      benches,
+      bench,
+      allTargets,
+      target,
+      allFeatures,
+      feature,
+      noDefaultFeatures,
+      release,
+      profile,
+      keepGoing,
+    )
+
+    let expect = ReturnType.SUCCESS
+    if (keepGoing) {
+      expect = ReturnType.FAILURE
+    }
+
+    let build = self
+      .buildContainer(sourceDateEpoch)
+      .withExec(
+        args,
+        expand: true,
+        redirectStdout: "/stdout.json",
+        redirectStderr: "/stderr",
+        expect: expect,
+      )
+
+    let binaries = removeTargetPrefix(
+      build.file("/stdout.json"),
+      "map(select(.executable != null) | {key: .target.name, value: (.executable | ltrimstr($root))}) | from_entries",
+    )
+
+    let libraries = removeTargetPrefix(
+      build.file("/stdout.json"),
+      """map(select(.reason == "compiler-artifact" and (.package_id | startswith("path+file://")) and ((.target.kind // []) | any(. == "lib" or . == "rlib" or . == "cdylib" or . == "dylib" or . == "staticlib" or . == "proc-macro")))) | map({key: .target.name, value: (.filenames | map(ltrimstr($root)))}) | from_entries""",
+    )
+
+    build
+      .withExec(["cp", "-RH", "${CARGO_TARGET_DIR}", "/work/out"], expand: true)
+      .directory("/work/out")
+      .withFile("binaries.json", binaries)
+      .withFile("libraries.json", libraries)
+  }
+
+  let removeTargetPrefix(input: File!, expr: String!): File! {
+    # Get the target directory from cargo metadata
+    # result.withExec(["cargo", "metadata", "--format-version", "1", "--no-deps"]).stdout
+
+    jq.eval(
+      expr: expr,
+      input: input,
+      args: [jq.arg("root", "/target/")],
+      slurp: true,
+    ).file
+  }
+
+  """
+  Execute all unit and integration tests and build examples of a local package.
+  """
+  pub test(
+    """
+    If specified, only run tests containing this string in their names.
+    """
+    testName: String! = "",
+    """
+    Arguments for the test binary.
+    """
+    args: [String!]! = [],
+    """
+    Run all tests regardless of failure.
+    """
+    noFailFast: Boolean! = false,
+    """
+    Package to run tests for.
+    """
+    package: [String!]! = [],
+    """
+    Test all packages in the workspace.
+    """
+    all: Boolean! = false,
+    """
+    Exclude packages from the test.
+    """
+    exclude: [String!]! = [],
+    """
+    Test only this package's library.
+    """
+    lib: Boolean! = false,
+    """
+    Test all binaries.
+    """
+    bins: Boolean! = false,
+    """
+    Test only the specified binary.
+    """
+    bin: [String!]! = [],
+    """
+    Test all examples.
+    """
+    examples: Boolean! = false,
+    """
+    Test only the specified example.
+    """
+    example: [String!]! = [],
+    """
+    Test all targets that have `test = true` set.
+    """
+    tests: Boolean! = false,
+    """
+    Test only the specified test target.
+    """
+    test: [String!]! = [],
+    """
+    Test all targets that have `bench = true` set.
+    """
+    benches: Boolean! = false,
+    """
+    Test only the specified bench target.
+    """
+    bench: [String!]! = [],
+    """
+    Test all targets (does not include doctests).
+    """
+    allTargets: Boolean! = false,
+    """
+    Build for the target triple.
+    """
+    target: [String!]! = [],
+    """
+    Test only this library's documentation.
+    """
+    doc: Boolean! = false,
+    """
+    Activate all available features.
+    """
+    allFeatures: Boolean! = false,
+    """
+    List of features to activate.
+    """
+    feature: [String!]! = [],
+    """
+    Do not activate the `default` feature.
+    """
+    noDefaultFeatures: Boolean! = false,
+    """
+    Build artifacts in release mode, with optimizations.
+    """
+    release: Boolean! = false,
+    """
+    Build artifacts with the specified profile.
+    """
+    profile: String! = "",
+    """
+    Override the source date epoch for reproducible builds.
+
+    If not set, the epoch is determined from the git log (if available).
+    """
+    sourceDateEpoch: String = null,
+  ): String! @check {
+    let cmd = CargoCommand(frozen: self.chef != null, locked: self.chef == null)
+    let args = cmd.test(
+      testName,
+      args,
+      noFailFast,
+      package,
+      all,
+      exclude,
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      tests,
+      test,
+      benches,
+      bench,
+      allTargets,
+      target,
+      doc,
+      allFeatures,
+      feature,
+      noDefaultFeatures,
+      release,
+      profile,
+    )
+
+    self
+      .buildContainer(sourceDateEpoch)
+      .withExec(args)
+      .combinedOutput
+  }
+
+  """
+  Audit Cargo.lock files for vulnerable crates.
+  """
+  pub audit(
+    """
+    Exit with an error on any violation.
+    """
+    deny: CargoAuditDeny = null,
+    """
+    Advisory id to ignore (can be specified multiple times).
+    """
+    ignore: [String!]! = [],
+    """
+    Directory containing the advisory database.
+    """
+    db: Directory! = Dagger.git("https://github.com/rustsec/advisory-db.git").head.tree,
+  ): String! @check {
+    let DB_PATH = "/var/advisory-db"
+
+    let args = [
+      "cargo", "audit",
+      "--no-fetch", "--stale", "--db", DB_PATH,
+    ]
+
+    if (deny != null) {
+      args += ["--deny", toString(deny)]
+    }
+
+    ignore.each { advisory =>
+      args += ["--ignore", advisory]
+    }
+
+    self
+      .buildContainer
+      .withMountedDirectory(DB_PATH, db)
+      .withExec(args)
+      .stdout
+  }
+
+  """
+  Checks Rust source formatting with `cargo fmt --check`.
+  """
+  pub fmt: String! @check {
+    self
+      .buildContainer
+      .withExec(["cargo", "fmt", "--", "--check"])
+      .stdout
+  }
+
+  """
+  Checks a package to catch common mistakes and improve your Rust code.
+  """
+  pub clippy(
+    """
+    Run Clippy only on the given crate, without linting the dependencies.
+    """
+    noDeps: Boolean! = true,
+    """
+    Set lint warnings.
+    """
+    warn: [String!]! = [],
+    """
+    Set lint allowed.
+    """
+    allow: [String!]! = [],
+    """
+    Set lint denied.
+    """
+    deny: [String!]! = [],
+    """
+    Set lint forbidden.
+    """
+    forbid: [String!]! = [],
+  ): String! @check {
+    let args = CargoCommand.generic("clippy")
+    if (noDeps) {
+      args += ["--no-deps"]
+    }
+
+    args += ["--"]
+
+    warn.each { w => args += ["--warn", w] }
+    allow.each { a => args += ["--allow", a] }
+    deny.each { d => args += ["--deny", d] }
+    forbid.each { f => args += ["--forbid", f] }
+
+    self
+      .buildContainer
+      .withExec(args)
+      .stdout
+  }
+
+  """
+  Build a package's documentation.
+  """
+  pub doc(
+    """
+    Don't build documentation for dependencies.
+    """
+    noDeps: Boolean! = true,
+    """
+    Package to run tests for.
+    """
+    package: [String!]! = [],
+    """
+    Test all packages in the workspace.
+    """
+    all: Boolean! = false,
+    """
+    Exclude packages from the test.
+    """
+    exclude: [String!]! = [],
+    """
+    Test only this package's library.
+    """
+    lib: Boolean! = false,
+    """
+    Test all binaries.
+    """
+    bins: Boolean! = false,
+    """
+    Test only the specified binary.
+    """
+    bin: [String!]! = [],
+    """
+    Test all examples.
+    """
+    examples: Boolean! = false,
+    """
+    Test only the specified example.
+    """
+    example: [String!]! = [],
+    """
+    Activate all available features.
+    """
+    allFeatures: Boolean! = false,
+    """
+    List of features to activate.
+    """
+    feature: [String!]! = [],
+    """
+    Do not activate the `default` feature.
+    """
+    noDefaultFeatures: Boolean! = false,
+    """
+    Build artifacts in release mode, with optimizations.
+    """
+    release: Boolean! = false,
+    """
+    Build artifacts with the specified profile.
+    """
+    profile: String! = "",
+    """
+    Override the source date epoch for reproducible builds.
+
+    If not set, the epoch is determined from the git log (if available).
+    """
+    sourceDateEpoch: String = null,
+  ): String! @check {
+    let cmd = CargoCommand(frozen: self.chef != null, locked: self.chef == null)
+    let args = cmd.doc(
+      noDeps,
+      package,
+      all,
+      exclude,
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      allFeatures,
+      feature,
+      noDefaultFeatures,
+      release,
+      profile,
+    )
+
+    self
+      .buildContainer(sourceDateEpoch)
+      .withEnvVariable("RUSTDOCFLAGS", "-D warnings")
+      .withExec(args)
+      .stdout
+  }
+
+  """
+  Runs a fixer and returns a changeset that can be inspected or applied.
+  """
+  pub fix(
+    """
+    Tool to run.
+    """
+    tool: [FixTool!]! = FixTool.values,
+  ): Changeset! {
+    let container = self.buildContainer
+
+    tool.each { tool =>
+      container = case (tool) {
+        FixTool.CLIPPY => container.withExec(["rustup", "component", "add", "clippy"])
+        FixTool.FMT => container.withExec(["rustup", "component", "add", "rustfmt"])
+      }
+    }
+
+    if (tool.contains(FixTool.CLIPPY)) {
+      container = container
+        .withExec([
+          "cargo",
+          "clippy",
+          "--fix",
+          "--allow-dirty",
+          "--allow-staged",
+          "--allow-no-vcs",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings",
+        ])
+    }
+
+    if (tool.contains(FixTool.FMT)) {
+      container = container.withExec(["cargo", "fmt"])
+    }
+
+    container.directory("/work/src").changes(source)
+  }
+}
+
+enum CargoAuditDeny {
+  WARNINGS
+  UNMAINTAINED
+  UNSOUND
+  YANKED
+}
+
+type CargoChef {
+  let version: String!
+  let container: Container!
+
+  new(version: String! = "latest", container: Container!) {
+    self.version = version
+    self.container = installer(version).install(container)
+
+    self
+  }
+
+  let installer(version: String!): Installer! {
+    Installer(
+      GitHubDownloader(
+        repository: "LukeMathWalker/cargo-chef",
+        fileName: "cargo-chef-@@ARCH@@-unknown-linux-gnu.tar.xz",
+        version: version,
+        replacer: RustArchReplacer,
+      ),
+      ExtractToolComposer("cargo-chef", true),
+    )
+  }
+
+  """
+  Generates a cargo-chef recipe from the source tree.
+  """
+  pub recipe(source: Directory!, workspacePath: String! = ""): File! {
+    self
+      .container
+      .withMountedDirectory("/work/src", source)
+      .withWorkdir("/work/src/" + workspacePath)
+      .withExec(["cargo", "chef", "prepare", "--recipe-path", "recipe.json"])
+      .file("recipe.json")
+  }
+
+  """
+  Recipe extracted after the cargo-chef skeleton has fetched dependencies.
+  """
+  let warmedRecipe(source: Directory!, workspacePath: String! = ""): File! {
+    self
+      .container
+      .withWorkdir("/work")
+      .withFile("recipe.json", self.recipe(source, workspacePath))
+      .withExec(["cargo", "chef", "cook", "--recipe-path", "recipe.json", "--no-build"])
+      .withExec(["cargo", "fetch", "--locked"])
+      .file("recipe.json")
+  }
+
+  """
+  Warm the dependency cache in the container.
+  """
+  let warmContainer(
+    container: Container!,
+    source: Directory!,
+    workspacePath: String! = "",
+  ): Container! {
+    container.withFile("/cargo-chef/recipe.json", self.warmedRecipe(source, workspacePath))
+  }
+}
+
+interface Downloader {
+  pub download: File!
+}
+
+interface Replacer {
+  pub replace(s: String!): String!
+}
+
+type Replacers implements Replacer {
+  pub replacers: [Replacer!]!
+
+  pub replace(s: String!): String! {
+    self.replacers.each { replacer => s = replacer.replace(s) }
+
+    s
+  }
+}
+
+interface Composer {
+  pub compose(file: File!): Directory!
+}
+
+type ExtractToolComposer implements Composer {
+  pub name: String!
+  pub stripComponents: Boolean! = false
+
+  pub compose(file: File!): Directory! {
+    let args = ["bsdtar", "-xf", file.name, "-C", "out"]
+
+    if (self.stripComponents) { args += ["--strip-components", "1"] }
+
+    let file = alpine
+      .withExec(["apk", "add", "libarchive-tools"])
+      .withWorkdir("/work")
+      .withMountedFile(file.name, file)
+      .withExec(["mkdir", "-p", "out"])
+      .withExec(args)
+      .file("out/" + name)
+
+    Dagger.directory.withFile("/usr/local/bin/" + name, file)
+  }
+
+  let alpine: Container! {
+    Dagger
+      .container
+      .from("alpine:3.23.4")
+      .withMountedCache("/var/cache/apk", Dagger.cacheVolume("alpine-apk"))
+  }
+}
+
+type ExtractFilterComposer implements Composer {
+  pub include: [String!]!
+  pub stripComponents: Boolean! = false
+
+  pub compose(file: File!): Directory! {
+    let args = ["bsdtar", "-xf", file.name, "-C", "out"]
+
+    if (self.stripComponents) { args += ["--strip-components", "1"] }
+
+    let dir = alpine
+      .withExec(["apk", "add", "libarchive-tools"])
+      .withWorkdir("/work")
+      .withMountedFile(file.name, file)
+      .withExec(["mkdir", "-p", "out"])
+      .withExec(args)
+      .directory("out/")
+      .filter(include: self.include)
+
+    Dagger.directory.withDirectory("/usr/local/bin/", dir)
+  }
+
+  let alpine: Container! {
+    Dagger
+      .container
+      .from("alpine:3.23.4")
+      .withMountedCache("/var/cache/apk", Dagger.cacheVolume("alpine-apk"))
+  }
+}
+
+type ExtractArchiveComposer implements Composer {
+  pub destination: String! = "/usr/local"
+  pub stripComponents: Boolean! = false
+
+  pub compose(file: File!): Directory! {
+    let args = ["bsdtar", "-xf", file.name, "-C", "out"]
+
+    if (self.stripComponents) { args += ["--strip-components", "1"] }
+
+    let dir = alpine
+      .withExec(["apk", "add", "libarchive-tools"])
+      .withWorkdir("/work")
+      .withMountedFile(file.name, file)
+      .withExec(["mkdir", "-p", "out"])
+      .withExec(args)
+      .directory("out/")
+
+    Dagger.directory.withDirectory(self.destination, dir)
+  }
+
+  let alpine: Container! {
+    Dagger
+      .container
+      .from("alpine:3.23.4")
+      .withMountedCache("/var/cache/apk", Dagger.cacheVolume("alpine-apk"))
+  }
+}
+
+type BinaryComposer implements Composer {
+  pub compose(file: File!): Directory! {
+    Dagger.directory.withFile("/usr/local/bin/" + file.name, file)
+  }
+}
+
+type VersionReplacer implements Replacer {
+  pub version: String!
+
+  pub key: String! = "@@VERSION@@"
+
+  pub replace(s: String!): String! {
+    s.replace(self.key, self.version)
+  }
+}
+
+type RustArchReplacer implements Replacer {
+  pub key: String! = "@@ARCH@@"
+
+  pub replace(s: String!): String! {
+    let arch = case (Dagger.defaultPlatform) {
+      "linux/amd64" => "x86_64"
+      "linux/arm64" => "aarch64"
+      else => raise "unsupported platform: " + toString(Dagger.defaultPlatform).trim("\"")
+    }
+
+    s.replace(self.key, arch)
+  }
+}
+
+type RustArchReplacer implements Replacer {
+  pub key: String! = "@@ARCH@@"
+
+  pub replace(s: String!): String! {
+    let arch = case (Dagger.defaultPlatform) {
+      "linux/amd64" => "x86_64"
+      "linux/arm64" => "aarch64"
+      else => raise "unsupported platform: " + toString(Dagger.defaultPlatform).trim("\"")
+    }
+
+    s.replace(self.key, arch)
+  }
+}
+
+type GitHubDownloader implements Downloader {
+  let file: File!
+
+  new(
+    repository: String!,
+    fileName: String!,
+    version: String! = "latest",
+    replacer: Replacer = null,
+  ) {
+    if (replacer != null) {
+      fileName = replacer.replace(fileName)
+    }
+
+    self.file = ghRelease.resolve(repository: repository, version: version).asset(fileName).file
+
+    self
+  }
+
+  pub download: File! {
+    self.file
+  }
+}
+
+type CargoBuildDownloader implements Downloader {
+  let container: Container!
+
+  let name: String!
+  let version: String! = ""
+
+  new(container: Container!, name: String!, version: String! = "") {
+    self.container = container
+      .withMountedCache(
+        "/tool-target",
+        Dagger.cacheVolume("cargo-tool-" + name + "-" + version),
+      )
+      .withEnvVariable("CARGO_TARGET_DIR", "/tool-target")
+
+    self.name = name
+    self.version = version
+
+    self
+  }
+
+  pub download: File! {
+    let args = ["cargo", "install", self.name, "--locked"]
+
+    if (self.version != "") {
+      args += ["--version", self.version]
+    }
+
+    let container = self
+      .container
+      .withExec(args)
+
+    let binaryName = self.name
+    let cargoHome = container.envVariable("CARGO_HOME") ?? ""
+
+    if (!container.exists(
+      cargoHome + "/bin/" + binaryName,
+      expectedType: ExistsType.REGULAR_TYPE,
+    )) {
+      binaryName = container.withExec([
+        "sh",
+        "-c",
+        """cargo install --list | awk -v pkg="$1" '/^[^[:space:]]/{p=($1==pkg)} /^[[:space:]]/{if(p){print $1; f=1}} END{if(!f){print "no binaries found for "pkg > "/dev/stderr"; exit 1}}'""",
+        "_",
+        self.name,
+      ]).stdout.trimSpace
+    }
+
+    container.file("${CARGO_HOME}/bin/" + binaryName, expand: true)
+  }
+}
+
+type Installer {
+  pub downloader: Downloader!
+  pub composer: Composer!
+
+  pub install(container: Container!): Container! {
+    let file = self.downloader.download
+    let dir = self.composer.compose(file)
+
+    container.withDirectory("/", dir)
+  }
+}
+
+type CargoCommand {
+  let locked: Boolean! = false
+  let offline: Boolean! = false
+  let frozen: Boolean! = false
+
+  new(
+    """
+    Assert that `Cargo.lock` will remain unchanged.
+    """
+    locked: Boolean! = false,
+    """
+    Run without accessing the network.
+    """
+    offline: Boolean! = false,
+    """
+    Equivalent to specifying both --locked and --offline.
+    """
+    frozen: Boolean! = false,
+  ) {
+    self.locked = locked
+    self.offline = offline
+    self.frozen = frozen
+
+    self
+  }
+
+  pub generic(command: String!): [String!]! {
+    let args = ["cargo", command]
+
+    args += self.globalArgs
+
+    args
+  }
+
+  """
+  Compile a local package and all of its dependencies.
+  """
+  pub build(
+    """
+    Package to build.
+    """
+    package: [String!]! = [],
+    """
+    Build all packages in the workspace.
+    """
+    all: Boolean! = false,
+    """
+    Exclude packages from the build.
+    """
+    exclude: [String!]! = [],
+    """
+    Build only this package's library.
+    """
+    lib: Boolean! = false,
+    """
+    Build all binaries.
+    """
+    bins: Boolean! = false,
+    """
+    Build only the specified binary.
+    """
+    bin: [String!]! = [],
+    """
+    Build all examples.
+    """
+    examples: Boolean! = false,
+    """
+    Build only the specified example.
+    """
+    example: [String!]! = [],
+    """
+    Build all targets that have `test = true` set.
+    """
+    tests: Boolean! = false,
+    """
+    Build only the specified test target.
+    """
+    test: [String!]! = [],
+    """
+    Build all targets that have `bench = true` set.
+    """
+    benches: Boolean! = false,
+    """
+    Build only the specified bench target.
+    """
+    bench: [String!]! = [],
+    """
+    Build all targets.
+    """
+    allTargets: Boolean! = false,
+    """
+    Build for the target triple.
+    """
+    target: [String!]! = [],
+    """
+    Activate all available features.
+    """
+    allFeatures: Boolean! = false,
+    """
+    List of features to activate.
+    """
+    feature: [String!]! = [],
+    """
+    Do not activate the `default` feature.
+    """
+    noDefaultFeatures: Boolean! = false,
+    """
+    Build artifacts in release mode, with optimizations.
+    """
+    release: Boolean! = false,
+    """
+    Build artifacts with the specified profile.
+    """
+    profile: String! = "",
+    """
+    Do not abort the build as soon as there is an error.
+    """
+    keepGoing: Boolean! = false,
+  ): [String!]! {
+    let args = ["cargo", "build", "--message-format", "json-render-diagnostics"]
+
+    args += self.coreArgs(
+      package,
+      all,
+      exclude,
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      tests,
+      test,
+      benches,
+      bench,
+      false,
+      allTargets,
+      target,
+      allFeatures,
+      feature,
+      noDefaultFeatures,
+      release,
+      profile,
+      keepGoing,
+    )
+
+    args
+  }
+
+  """
+  Execute all unit and integration tests and build examples of a local package.
+  """
+  pub test(
+    """
+    If specified, only run tests containing this string in their names.
+    """
+    testName: String! = "",
+    """
+    Arguments for the test binary.
+    """
+    args: [String!]! = [],
+    """
+    Run all tests regardless of failure.
+    """
+    noFailFast: Boolean! = false,
+    """
+    Package to run tests for.
+    """
+    package: [String!]! = [],
+    """
+    Test all packages in the workspace.
+    """
+    all: Boolean! = false,
+    """
+    Exclude packages from the test.
+    """
+    exclude: [String!]! = [],
+    """
+    Test only this package's library.
+    """
+    lib: Boolean! = false,
+    """
+    Test all binaries.
+    """
+    bins: Boolean! = false,
+    """
+    Test only the specified binary.
+    """
+    bin: [String!]! = [],
+    """
+    Test all examples.
+    """
+    examples: Boolean! = false,
+    """
+    Test only the specified example.
+    """
+    example: [String!]! = [],
+    """
+    Test all targets that have `test = true` set.
+    """
+    tests: Boolean! = false,
+    """
+    Test only the specified test target.
+    """
+    test: [String!]! = [],
+    """
+    Test all targets that have `bench = true` set.
+    """
+    benches: Boolean! = false,
+    """
+    Test only the specified bench target.
+    """
+    bench: [String!]! = [],
+    """
+    Test all targets (does not include doctests).
+    """
+    allTargets: Boolean! = false,
+    """
+    Build for the target triple.
+    """
+    target: [String!]! = [],
+    """
+    Test only this library's documentation.
+    """
+    doc: Boolean! = false,
+    """
+    Activate all available features.
+    """
+    allFeatures: Boolean! = false,
+    """
+    List of features to activate.
+    """
+    feature: [String!]! = [],
+    """
+    Do not activate the `default` feature.
+    """
+    noDefaultFeatures: Boolean! = false,
+    """
+    Build artifacts in release mode, with optimizations.
+    """
+    release: Boolean! = false,
+    """
+    Build artifacts with the specified profile.
+    """
+    profile: String! = "",
+  ): [String!]! {
+    let _args = ["cargo", "test"]
+
+    if (noFailFast) { _args += ["--no-fail-fast"] }
+
+    _args += self.coreArgs(
+      package,
+      all,
+      exclude,
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      tests,
+      test,
+      benches,
+      bench,
+      doc,
+      allTargets,
+      target,
+      allFeatures,
+      feature,
+      noDefaultFeatures,
+      release,
+      profile,
+    )
+
+    if (testName != "") { _args += [testName] }
+
+    if (!args.isEmpty) {
+      _args += ["--"] + args
+    }
+
+    _args
+  }
+
+  """
+  Build a package's documentation.
+  """
+  pub doc(
+    """
+    Don't build documentation for dependencies.
+    """
+    noDeps: Boolean! = true,
+    """
+    Package to run tests for.
+    """
+    package: [String!]! = [],
+    """
+    Test all packages in the workspace.
+    """
+    all: Boolean! = false,
+    """
+    Exclude packages from the test.
+    """
+    exclude: [String!]! = [],
+    """
+    Test only this package's library.
+    """
+    lib: Boolean! = false,
+    """
+    Test all binaries.
+    """
+    bins: Boolean! = false,
+    """
+    Test only the specified binary.
+    """
+    bin: [String!]! = [],
+    """
+    Test all examples.
+    """
+    examples: Boolean! = false,
+    """
+    Test only the specified example.
+    """
+    example: [String!]! = [],
+    """
+    Activate all available features.
+    """
+    allFeatures: Boolean! = false,
+    """
+    List of features to activate.
+    """
+    feature: [String!]! = [],
+    """
+    Do not activate the `default` feature.
+    """
+    noDefaultFeatures: Boolean! = false,
+    """
+    Build artifacts in release mode, with optimizations.
+    """
+    release: Boolean! = false,
+    """
+    Build artifacts with the specified profile.
+    """
+    profile: String! = "",
+  ): [String!]! {
+    let args = ["cargo", "doc"]
+
+    if (noDeps) { args += ["--no-deps"] }
+
+    args += self.coreArgs(
+      package,
+      all,
+      exclude,
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      false,
+      [],
+      false,
+      [],
+      false,
+      false,
+      [],
+      allFeatures,
+      feature,
+      noDefaultFeatures,
+      release,
+      profile,
+    )
+
+    args
+  }
+
+  let globalArgs: [String!]! {
+    let args = []
+
+    if (self.locked) { args += ["--locked"] }
+
+    if (self.offline) { args += ["--offline"] }
+
+    if (self.frozen) { args += ["--frozen"] }
+
+    args
+  }
+
+  let coreArgs(
+    package: [String!]! = [],
+    all: Boolean! = false,
+    exclude: [String!]! = [],
+    lib: Boolean! = false,
+    bins: Boolean! = false,
+    bin: [String!]! = [],
+    examples: Boolean! = false,
+    example: [String!]! = [],
+    tests: Boolean! = false,
+    test: [String!]! = [],
+    benches: Boolean! = false,
+    bench: [String!]! = [],
+    doc: Boolean! = false,
+    allTargets: Boolean! = false,
+    target: [String!]! = [],
+    allFeatures: Boolean! = false,
+    feature: [String!]! = [],
+    noDefaultFeatures: Boolean! = false,
+    release: Boolean! = false,
+    profile: String! = "",
+    keepGoing: Boolean! = false,
+  ): [String!]! {
+    let args = []
+
+    args += self.globalArgs
+
+    args += self.packageSelection(package, all, exclude)
+
+    args += self.targetSelection(
+      lib,
+      bins,
+      bin,
+      examples,
+      example,
+      tests,
+      test,
+      benches,
+      bench,
+      doc,
+      allTargets,
+      target,
+    )
+
+    args += self.featureSelection(allFeatures, feature, noDefaultFeatures)
+
+    args += self.compilationOptions(release, profile, keepGoing)
+
+    args
+  }
+
+  let packageSelection(
+    package: [String!]! = [],
+    all: Boolean! = false,
+    exclude: [String!]! = [],
+  ): [String!]! {
+    let args = []
+
+    package.each { p => args += ["--package", p] }
+
+    if (all) { args += ["--workspace"] }
+
+    exclude.each { e => args += ["--exclude", e] }
+
+    args
+  }
+
+  let targetSelection(
+    lib: Boolean! = false,
+    bins: Boolean! = false,
+    bin: [String!]! = [],
+    examples: Boolean! = false,
+    example: [String!]! = [],
+    tests: Boolean! = false,
+    test: [String!]! = [],
+    benches: Boolean! = false,
+    bench: [String!]! = [],
+    doc: Boolean! = false,
+    allTargets: Boolean! = false,
+    target: [String!]! = [],
+  ): [String!]! {
+    let args = []
+
+    if (lib) { args += ["--lib"] }
+
+    if (bins) { args += ["--bins"] }
+
+    bin.each { b => args += ["--bin", b] }
+
+    if (examples) { args += ["--examples"] }
+
+    example.each { e => args += ["--example", e] }
+
+    if (tests) { args += ["--tests"] }
+
+    test.each { t => args += ["--test", t] }
+
+    if (benches) { args += ["--benches"] }
+
+    bench.each { b => args += ["--bench", b] }
+
+    if (doc) { args += ["--doc"] }
+
+    if (allTargets) { args += ["--all-targets"] }
+
+    target.each { t => args += ["--target", t] }
+
+    args
+  }
+
+  let featureSelection(
+    allFeatures: Boolean! = false,
+    feature: [String!]! = [],
+    noDefaultFeatures: Boolean! = false,
+  ): [String!]! {
+    let args = []
+
+    if (allFeatures) { args += ["--all-features"] }
+
+    feature.each { f => args += ["--features", f] }
+
+    if (noDefaultFeatures) {
+      args += ["--no-default-features"]
+    }
+
+    args
+  }
+
+  let compilationOptions(
+    release: Boolean! = false,
+    profile: String! = "",
+    keepGoing: Boolean! = false,
+  ): [String!]! {
+    let args = []
+
+    if (release) { args += ["--release"] }
+
+    if (profile != "") { args += ["--profile", profile] }
+
+    if (keepGoing) { args += ["--keep-going"] }
+
+    args
+  }
+}

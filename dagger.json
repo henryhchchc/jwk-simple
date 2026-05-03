@@ -1,0 +1,10 @@
+{
+  "name": "jwk-simple",
+  "engineVersion": "v0.21.3",
+  "toolchains": [
+    {
+      "name": "rust",
+      "source": "dagger/rust"
+    }
+  ]
+}
