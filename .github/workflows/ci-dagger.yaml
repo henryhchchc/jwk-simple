@@ -1,0 +1,110 @@
+name: CI (Dagger)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  DAGGER_VERSION: 0.21.3
+
+jobs:
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check
+        uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+        with:
+          verb: check
+          args: rust:audit
+          version: ${{ env.DAGGER_VERSION }}
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     include:
+    #       - name: native
+    #         target: x86_64-unknown-linux-gnu
+    #         features: http,jwt-simple,jwt-simple/pure-rust,moka
+    #       - name: wasm
+    #         target: wasm32-unknown-unknown
+    #         features: cloudflare,http,jwt-simple,jwt-simple/pure-rust,web-crypto
+
+    # env:
+    #   CARGO_BUILD_TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check
+        uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+        with:
+          verb: check
+          args: rust:build
+          version: ${{ env.DAGGER_VERSION }}
+
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     include:
+    #       - name: native
+    #         target: x86_64-unknown-linux-gnu
+    #         features: http,jwt-simple,jwt-simple/pure-rust,moka
+    #       - name: wasm
+    #         target: wasm32-unknown-unknown
+    #         features: cloudflare,http,jwt-simple,jwt-simple/pure-rust,web-crypto
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check
+        uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+        with:
+          verb: check
+          args: rust:test
+          version: ${{ env.DAGGER_VERSION }}
+
+  lint:
+    name: Lint
+    # name: Lint (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     include:
+    #       - name: native
+    #         target: x86_64-unknown-linux-gnu
+    #         features: http,jwt-simple,jwt-simple/pure-rust,moka
+    #       - name: wasm
+    #         target: wasm32-unknown-unknown
+    #         features: cloudflare,http,jwt-simple,jwt-simple/pure-rust,web-crypto
+
+    # env:
+    #   CARGO_BUILD_TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check
+        uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+        with:
+          verb: check
+          args: rust:fmt rust:clippy rust:doc
+          version: ${{ env.DAGGER_VERSION }}
